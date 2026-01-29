@@ -3,11 +3,11 @@ core_utils.py
 
 Project-wide utilities used by Streamlit apps and bank parsers.
 
-Goals:
-1) Standardize input handling (PDF bytes)
-2) Standardize transaction schema and types
-3) Make date/amount parsing resilient across banks
-4) Provide consistent monthly summary computation
+Design goals:
+- Provide a stable, backward-compatible API for all bank parsers
+- Standardize transaction schema across banks
+- Robust date + money parsing
+- Safe dedupe helpers
 """
 
 from __future__ import annotations
@@ -23,8 +23,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 # PDF INPUT
 # =============================================================================
 def read_pdf_bytes(pdf_input: Any) -> bytes:
-    """
-    Return PDF bytes from:
+    """Return PDF bytes from:
     - bytes / bytearray
     - Streamlit UploadedFile (has getvalue)
     - file-like objects (has read)
@@ -58,37 +57,39 @@ def sha1_bytes(data: bytes) -> str:
 
 
 # =============================================================================
-# TEXT / NUMBER NORMALIZATION
+# TEXT NORMALIZATION
 # =============================================================================
 _WS_RE = re.compile(r"\s+")
 _NON_PRINTABLE_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]+")
 
+
 def normalize_text(x: Any) -> str:
-    """
-    Convert to a clean one-line string:
-    - strip
-    - collapse whitespace
-    - remove non-printable
-    """
+    """Normalize to a clean single-line string."""
     if x is None:
         return ""
     s = str(x)
     s = _NON_PRINTABLE_RE.sub(" ", s)
-    s = s.replace("\u00a0", " ")  # nbsp
+    s = s.replace("\u00a0", " ")
     s = _WS_RE.sub(" ", s).strip()
     return s
+
+
+# =============================================================================
+# MONEY / NUMBER PARSING
+# =============================================================================
+_MONEY_TOKEN_RE = re.compile(r"^-?\(?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?[+-]?$|^-?\d+(?:\.\d{2})?[+-]?$")
 
 
 def safe_float(x: Any, default: float = 0.0) -> float:
     """
     Parse common money-like strings into float.
-    Accepts:
+    Supports:
       "1,234.56"
       "-1,234.56"
       "(1,234.56)"  -> -1234.56
       "1,234.56-"   -> -1234.56
       "1,234.56+"   -> +1234.56
-    Returns default on failure.
+      "RM 1,234.56"
     """
     if x is None:
         return default
@@ -101,6 +102,9 @@ def safe_float(x: Any, default: float = 0.0) -> float:
     s = normalize_text(x)
     if not s:
         return default
+
+    # strip currency
+    s = s.replace("RM", "").replace("MYR", "").strip()
 
     neg = False
 
@@ -116,14 +120,12 @@ def safe_float(x: Any, default: float = 0.0) -> float:
     elif s.endswith("+"):
         s = s[:-1].strip()
 
-    # remove currency and spaces
-    s = s.replace("RM", "").replace("MYR", "")
-    s = s.replace(",", "").replace(" ", "")
-
-    # allow leading sign
+    # leading sign
     if s.startswith("-"):
         neg = True
-        s = s[1:]
+        s = s[1:].strip()
+
+    s = s.replace(",", "").replace(" ", "")
 
     if not re.fullmatch(r"\d+(?:\.\d+)?", s):
         return default
@@ -135,26 +137,53 @@ def safe_float(x: Any, default: float = 0.0) -> float:
         return default
 
 
+def parse_amount(x: Any) -> Optional[float]:
+    """Older parsers sometimes call parse_amount; keep it."""
+    if x is None:
+        return None
+    s = normalize_text(x)
+    if not s:
+        return None
+    if not _MONEY_TOKEN_RE.match(s.replace("RM", "").replace("MYR", "").strip()):
+        # still attempt safe_float; it returns default but we want None on failure
+        v = safe_float(s, default=float("nan"))
+        return None if v != v else v
+    v = safe_float(s, default=float("nan"))
+    return None if v != v else v
+
+
 # =============================================================================
 # DATE NORMALIZATION
 # =============================================================================
-# Supported:
-#  - ISO: 2025-05-31
-#  - D/M/Y or DD/MM/YY: 31/5/2025, 31/05/25
-#  - D-M-Y: 31-05-2025
-#  - DMY compact: 150525 (DDMMYY), 15052025 (DDMMYYYY)
-#  - "01May" style handled by specific bank parsers, but we still expose helpers
 _ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DMY_SLASH_RE = re.compile(r"^(?P<d>\d{1,2})/(?P<m>\d{1,2})/(?P<y>\d{2,4})$")
 _DMY_DASH_RE = re.compile(r"^(?P<d>\d{1,2})-(?P<m>\d{1,2})-(?P<y>\d{2,4})$")
+# ✅ NEW: Alliance format ddmmyy / ddmmyyyy
 _DDMMYY_RE = re.compile(r"^(?P<d>\d{2})(?P<m>\d{2})(?P<y>\d{2})$")
 _DDMMYYYY_RE = re.compile(r"^(?P<d>\d{2})(?P<m>\d{2})(?P<y>\d{4})$")
+
+# "01May2025" / "01May" etc. (some parsers might pass this in)
+_DD_MON_RE = re.compile(r"^(?P<d>\d{1,2})(?P<mon>[A-Za-z]{3})(?P<y>\d{2,4})?$")
+
+_MON_MAP = {
+    "JAN": 1,
+    "FEB": 2,
+    "MAR": 3,
+    "APR": 4,
+    "MAY": 5,
+    "JUN": 6,
+    "JUL": 7,
+    "AUG": 8,
+    "SEP": 9,
+    "OCT": 10,
+    "NOV": 11,
+    "DEC": 12,
+}
 
 
 def _to_year(y: str) -> int:
     y = str(y)
     if len(y) == 2:
-        # assume 2000+
         return 2000 + int(y)
     return int(y)
 
@@ -163,15 +192,21 @@ def normalize_date(value: Any, *, default_year: Optional[int] = None) -> Optiona
     """
     Normalize date into ISO 'YYYY-MM-DD', else None.
 
-    default_year:
-      used only when a parser passes a partial date (rare). This function mainly
-      supports full dates. If you pass something like "31/05", handle it in bank parser.
+    Supports:
+    - YYYY-MM-DD
+    - DD/MM/YYYY, D/M/YY
+    - DD-MM-YYYY
+    - DDMMYY (Alliance)
+    - DDMMYYYY (Alliance)
+    - 01May2025 / 01May (year may use default_year)
     """
     if value is None:
         return None
 
-    if isinstance(value, (datetime, date)):
-        return value.date().isoformat() if isinstance(value, datetime) else value.isoformat()
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
 
     s = normalize_text(value)
     if not s:
@@ -220,7 +255,20 @@ def normalize_date(value: Any, *, default_year: Optional[int] = None) -> Optiona
         except Exception:
             return None
 
-    # If something like "31/05" appears, bank parsers should resolve year using statement date.
+    m = _DD_MON_RE.match(s)
+    if m:
+        d = int(m.group("d"))
+        mon = m.group("mon").upper()
+        mo = _MON_MAP.get(mon)
+        y_raw = m.group("y")
+        y = _to_year(y_raw) if y_raw else default_year
+        if mo and y:
+            try:
+                return date(int(y), mo, d).isoformat()
+            except Exception:
+                return None
+
+    # partial dd/mm with default_year
     if default_year is not None:
         m2 = re.match(r"^(?P<d>\d{1,2})/(?P<m>\d{1,2})$", s)
         if m2:
@@ -235,9 +283,6 @@ def normalize_date(value: Any, *, default_year: Optional[int] = None) -> Optiona
 
 
 def month_key(iso_date: str) -> Optional[str]:
-    """
-    Convert ISO date YYYY-MM-DD to month key YYYY-MM.
-    """
     if not iso_date or not isinstance(iso_date, str):
         return None
     if not _ISO_RE.fullmatch(iso_date):
@@ -246,51 +291,92 @@ def month_key(iso_date: str) -> Optional[str]:
 
 
 # =============================================================================
-# TRANSACTION STANDARDIZATION
+# TRANSACTION STANDARDIZATION (THIS FIXES YOUR IMPORTERROR)
 # =============================================================================
-def standardize_transaction(tx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Force a consistent schema, safe types, and rounding.
-    Expected keys (best-effort):
-      date, description, debit, credit, balance, page, bank, source_file
-    """
-    out: Dict[str, Any] = dict(tx or {})
-
-    out["date"] = normalize_date(out.get("date")) or out.get("date")
-    out["description"] = normalize_text(out.get("description", ""))
-    out["debit"] = round(safe_float(out.get("debit", 0.0)), 2)
-    out["credit"] = round(safe_float(out.get("credit", 0.0)), 2)
-    out["balance"] = round(safe_float(out.get("balance", 0.0)), 2) if out.get("balance") is not None else None
-
-    # keep page as int when possible
+def _coerce_page(x: Any) -> Optional[int]:
+    if x is None:
+        return None
     try:
-        out["page"] = int(out["page"]) if out.get("page") is not None else None
+        return int(x)
     except Exception:
-        out["page"] = out.get("page")
+        return None
 
-    out["bank"] = normalize_text(out.get("bank", ""))
-    out["source_file"] = normalize_text(out.get("source_file", ""))
+
+def normalize_transactions(
+    txns: List[Dict[str, Any]],
+    *,
+    default_bank: str = "",
+    source_file: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    Normalize bank-specific extracted transactions into a standard schema:
+
+      {
+        "date": "YYYY-MM-DD" or None,
+        "description": str,
+        "debit": float,
+        "credit": float,
+        "balance": float or None,
+        "page": int or None,
+        "bank": str,
+        "source_file": str,
+        ... (preserve extra keys)
+      }
+
+    This keeps compatibility with the rest of your repo.
+    """
+    out: List[Dict[str, Any]] = []
+    for t in (txns or []):
+        if not isinstance(t, dict):
+            continue
+
+        row = dict(t)
+
+        # Date normalization
+        d = row.get("date")
+        row["date"] = normalize_date(d) if d is not None else None
+
+        # Description
+        row["description"] = normalize_text(row.get("description", ""))
+
+        # Support alt keys used by some parsers
+        # - amount + dr_cr
+        if row.get("debit") is None and row.get("credit") is None and row.get("amount") is not None:
+            amt = safe_float(row.get("amount"), default=0.0)
+            side = normalize_text(row.get("dr_cr", "")).upper()
+            if side in ("DR", "DEBIT"):
+                row["debit"] = abs(amt)
+                row["credit"] = 0.0
+            elif side in ("CR", "CREDIT"):
+                row["debit"] = 0.0
+                row["credit"] = abs(amt)
+
+        row["debit"] = round(safe_float(row.get("debit", 0.0), default=0.0), 2)
+        row["credit"] = round(safe_float(row.get("credit", 0.0), default=0.0), 2)
+
+        bal = row.get("balance", None)
+        row["balance"] = None if bal is None else round(safe_float(bal, default=0.0), 2)
+
+        row["page"] = _coerce_page(row.get("page"))
+        row["bank"] = normalize_text(row.get("bank") or default_bank)
+        row["source_file"] = normalize_text(row.get("source_file") or source_file)
+
+        out.append(row)
 
     return out
 
 
-def standardize_transactions(txs: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [standardize_transaction(t) for t in (txs or [])]
-
-
 def dedupe_transactions(
-    txs: List[Dict[str, Any]],
+    txns: List[Dict[str, Any]],
     *,
-    key_fields: Tuple[str, ...] = ("date", "description", "debit", "credit", "balance", "source_file"),
+    key_fields: Tuple[str, ...] = ("date", "description", "debit", "credit", "balance", "page", "source_file"),
 ) -> List[Dict[str, Any]]:
-    """
-    Remove exact duplicates based on a stable tuple key.
-    Keeps first occurrence.
-    """
+    """Generic dedupe used by most banks."""
     seen = set()
     out: List[Dict[str, Any]] = []
-    for tx in txs or []:
-        t = standardize_transaction(tx)
+    for t in (txns or []):
+        if not isinstance(t, dict):
+            continue
         key = tuple(t.get(k) for k in key_fields)
         if key in seen:
             continue
@@ -299,101 +385,19 @@ def dedupe_transactions(
     return out
 
 
-# =============================================================================
-# MONTHLY SUMMARY (STANDARD)
-# =============================================================================
-def _compute_opening_from_first_tx(first_tx: Dict[str, Any]) -> Optional[float]:
+def dedupe_transactions_affin(txns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Given first transaction and its balance + debit/credit, infer opening balance.
-    opening + credit - debit = first_balance
-    => opening = first_balance - credit + debit
+    Affin statements often create near-duplicates (wrap lines / repeated headers).
+    We dedupe using a slightly more tolerant key (ignore page if needed).
     """
-    bal = first_tx.get("balance")
-    if bal is None:
-        return None
-    balf = safe_float(bal, default=0.0)
-    cr = safe_float(first_tx.get("credit", 0.0), default=0.0)
-    dr = safe_float(first_tx.get("debit", 0.0), default=0.0)
-    return round(balf - cr + dr, 2)
-
-
-def compute_monthly_summary(
-    txs: List[Dict[str, Any]],
-    *,
-    include_opening_in_minmax: bool = True,
-) -> List[Dict[str, Any]]:
-    """
-    Returns list of dict rows with:
-      month, transaction_count, opening_balance, total_debit, total_credit, net_change,
-      highest_balance, lowest_balance, source_files
-
-    Notes:
-    - opening_balance is inferred from the FIRST tx in that month using:
-        opening = first_balance - credit + debit
-      This is the safest generalized approach across banks when per-tx balance exists.
-    - closing balance is last tx balance; net_change = closing - opening.
-    - high/low uses tx balances (and optionally opening).
-    """
-    if not txs:
-        return []
-
-    txs_std = [t for t in standardize_transactions(txs) if isinstance(t.get("date"), str)]
-    # only keep ISO dates
-    txs_std = [t for t in txs_std if month_key(t["date"])]
-
-    # sort by date then page as tie-breaker
-    txs_std.sort(key=lambda t: (t.get("date") or "", t.get("page") or 0))
-
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
-    for tx in txs_std:
-        mk = month_key(tx["date"])
-        if not mk:
-            continue
-        grouped.setdefault(mk, []).append(tx)
-
-    rows: List[Dict[str, Any]] = []
-    for mk in sorted(grouped.keys()):
-        items = grouped[mk]
-        if not items:
-            continue
-
-        first = items[0]
-        last = items[-1]
-
-        opening = _compute_opening_from_first_tx(first)
-        closing = last.get("balance")
-        closing_f = safe_float(closing, default=0.0) if closing is not None else None
-
-        total_debit = round(sum(safe_float(t.get("debit", 0.0)) for t in items), 2)
-        total_credit = round(sum(safe_float(t.get("credit", 0.0)) for t in items), 2)
-
-        # net change
-        if opening is not None and closing_f is not None:
-            net_change = round(closing_f - opening, 2)
-        else:
-            net_change = round(total_credit - total_debit, 2)
-
-        balances = [safe_float(t.get("balance"), default=0.0) for t in items if t.get("balance") is not None]
-        if include_opening_in_minmax and opening is not None:
-            balances = [opening] + balances
-
-        highest = round(max(balances), 2) if balances else None
-        lowest = round(min(balances), 2) if balances else None
-
-        src_files = sorted({normalize_text(t.get("source_file", "")) for t in items if t.get("source_file")})
-
-        rows.append(
-            {
-                "month": mk,
-                "transaction_count": len(items),
-                "opening_balance": opening,
-                "total_debit": total_debit,
-                "total_credit": total_credit,
-                "net_change": net_change,
-                "highest_balance": highest,
-                "lowest_balance": lowest,
-                "source_files": src_files,
-            }
-        )
-
-    return rows
+    # First pass: strict
+    strict = dedupe_transactions(
+        txns,
+        key_fields=("date", "description", "debit", "credit", "balance", "page", "source_file"),
+    )
+    # Second pass: tolerant (drop page)
+    tolerant = dedupe_transactions(
+        strict,
+        key_fields=("date", "description", "debit", "credit", "balance", "source_file"),
+    )
+    return tolerant
