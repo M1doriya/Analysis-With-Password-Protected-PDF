@@ -1,0 +1,24 @@
+# Bank Statement Parser - Requirements
+# Python 3.8+
+
+# Core dependencies
+streamlit>=1.28.0
+pdfplumber>=0.9.0
+pandas>=2.0.0
+xlsxwriter>=3.0.0
+
+# Additional dependencies for PDF processing
+Pillow>=9.0.0
+regex>=2023.0.0
+
+# Optional but recommended
+openpyxl>=3.0.0
+
+# PDF processing dependencies
+pdfminer.six>=20221105
+cryptography>=41.0.0
+pymupdf
+
+pytesseract
+Pillow
+

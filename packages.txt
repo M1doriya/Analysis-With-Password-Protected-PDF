@@ -1,0 +1,3 @@
+libpoppler-dev
+poppler-utils
+tesseract-ocr
