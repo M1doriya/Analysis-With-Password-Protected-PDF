@@ -13,6 +13,7 @@ Key upgrades in this version:
 
 from __future__ import annotations
 
+import importlib
 import json
 from io import BytesIO
 from typing import Callable, Dict, List, Optional
@@ -30,32 +31,71 @@ from core_utils import (
 from pdf_security import decrypt_pdf_bytes, is_pdf_encrypted
 from ocr_fallback import ocr_pdf_to_text_pages, parse_transactions_from_ocr_text_pages
 
-# Existing bank parsers (already in your repo)
-from maybank import parse_transactions_maybank
-from public_bank import parse_transactions_pbb
-from rhb import parse_transactions_rhb
-from cimb import parse_transactions_cimb, extract_cimb_statement_totals
-from bank_islam import parse_bank_islam
-from bank_rakyat import parse_bank_rakyat
-from hong_leong import parse_hong_leong
-from ambank import parse_ambank, extract_ambank_statement_totals
-from bank_muamalat import parse_transactions_bank_muamalat
-from affin_bank import parse_affin_bank, extract_affin_statement_totals
-from agro_bank import parse_agro_bank
-from ocbc import parse_transactions_ocbc
 
-# New bank: Alliance
-from alliance_bank import parse_alliance_bank, extract_alliance_statement_totals
+# =============================================================================
+# SAFE IMPORT HELPERS (prevents "fix one, break another")
+# =============================================================================
+def _load_module(name: str):
+    return importlib.import_module(name)
+
+
+def _get_required(mod, *names: str):
+    """
+    Return the first attribute found in names.
+    Raise ImportError if none exist.
+    """
+    for n in names:
+        if hasattr(mod, n):
+            return getattr(mod, n)
+    raise ImportError(f"Module '{mod.__name__}' is missing required function(s): {names}")
+
+
+def _get_optional(mod, name: str, default):
+    return getattr(mod, name, default)
+
+
+# =============================================================================
+# LOAD BANK MODULES (robust to missing optional functions)
+# =============================================================================
+maybank_mod = _load_module("maybank")
+public_bank_mod = _load_module("public_bank")
+rhb_mod = _load_module("rhb")
+cimb_mod = _load_module("cimb")
+bank_islam_mod = _load_module("bank_islam")
+bank_rakyat_mod = _load_module("bank_rakyat")
+hong_leong_mod = _load_module("hong_leong")
+ambank_mod = _load_module("ambank")
+bank_muamalat_mod = _load_module("bank_muamalat")
+affin_mod = _load_module("affin_bank")
+agro_mod = _load_module("agro_bank")
+ocbc_mod = _load_module("ocbc")
+alliance_mod = _load_module("alliance_bank")
+
+# Required parse functions (fallback aliases supported)
+parse_transactions_maybank = _get_required(maybank_mod, "parse_transactions_maybank", "parse_maybank", "parse_transactions")
+parse_transactions_pbb = _get_required(public_bank_mod, "parse_transactions_pbb", "parse_public_bank", "parse_transactions")
+parse_transactions_rhb = _get_required(rhb_mod, "parse_transactions_rhb", "parse_rhb", "parse_transactions")
+parse_transactions_cimb = _get_required(cimb_mod, "parse_transactions_cimb", "parse_cimb", "parse_transactions")
+parse_bank_islam = _get_required(bank_islam_mod, "parse_bank_islam", "parse_transactions_bank_islam", "parse_transactions")
+parse_bank_rakyat = _get_required(bank_rakyat_mod, "parse_bank_rakyat", "parse_transactions_bank_rakyat", "parse_transactions")
+parse_hong_leong = _get_required(hong_leong_mod, "parse_hong_leong", "parse_transactions_hong_leong", "parse_transactions")
+parse_ambank = _get_required(ambank_mod, "parse_ambank", "parse_transactions_ambank", "parse_transactions")
+parse_transactions_bank_muamalat = _get_required(bank_muamalat_mod, "parse_transactions_bank_muamalat", "parse_bank_muamalat", "parse_transactions")
+parse_affin_bank = _get_required(affin_mod, "parse_affin_bank", "parse_transactions_affin", "parse_transactions")
+parse_agro_bank = _get_required(agro_mod, "parse_agro_bank", "parse_transactions_agrobank", "parse_transactions")
+parse_transactions_ocbc = _get_required(ocbc_mod, "parse_transactions_ocbc", "parse_ocbc", "parse_transactions")
+parse_alliance_bank = _get_required(alliance_mod, "parse_alliance_bank", "parse_transactions_alliance", "parse_transactions")
+
+# Optional statement totals extractors (safe default = {})
+extract_cimb_statement_totals = _get_optional(cimb_mod, "extract_cimb_statement_totals", lambda pdf: {})
+extract_ambank_statement_totals = _get_optional(ambank_mod, "extract_ambank_statement_totals", lambda pdf: {})
+extract_affin_statement_totals = _get_optional(affin_mod, "extract_affin_statement_totals", lambda pdf: {})
+extract_alliance_statement_totals = _get_optional(alliance_mod, "extract_alliance_statement_totals", lambda pdf: {})
 
 
 def _parse_with_pdfplumber(parser_func: Callable, pdf_bytes: bytes, filename: str) -> List[dict]:
-    """
-    Open PDF bytes using pdfplumber and call bank parser.
-
-    We keep this wrapper so individual bank modules don't have to worry about file streams.
-    """
+    """Open PDF bytes using pdfplumber and call bank parser expecting signature (pdf, filename)."""
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        # Most bank parser funcs in this repo have signature (pdf, filename)
         return parser_func(pdf, filename)
 
 
@@ -66,20 +106,18 @@ def _extract_statement_totals(bank_choice: str, pdf_bytes: bytes) -> Dict[str, D
     """
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         if bank_choice == "Affin Bank":
-            return extract_affin_statement_totals(pdf)
+            return extract_affin_statement_totals(pdf) or {}
         if bank_choice == "AmBank":
-            return extract_ambank_statement_totals(pdf)
+            return extract_ambank_statement_totals(pdf) or {}
         if bank_choice == "CIMB Bank":
-            return extract_cimb_statement_totals(pdf)
+            return extract_cimb_statement_totals(pdf) or {}
         if bank_choice == "Alliance Bank":
-            return extract_alliance_statement_totals(pdf)
+            return extract_alliance_statement_totals(pdf) or {}
     return {}
 
 
 def _count_real_transactions(txns: List[dict]) -> int:
-    """
-    Exclude balance-marker rows from 'transaction_count'.
-    """
+    """Exclude balance-marker rows from 'transaction_count'."""
     n = 0
     for t in txns:
         desc = (t.get("description") or "").upper()
@@ -98,13 +136,7 @@ def _count_real_transactions(txns: List[dict]) -> int:
 
 
 def _build_monthly_summary(df: pd.DataFrame, statement_totals_by_file: Dict[str, Dict[str, Dict]]) -> pd.DataFrame:
-    """
-    Standard monthly summary table with required columns:
-      month, transaction_count, opening_balance, total_debit, total_credit,
-      net_change, highest_balance, lowest_balance, source_files
-
-    We compute from normalized transactions, then (optionally) overlay statement totals if available.
-    """
+    """Standard monthly summary table with required columns."""
     if df.empty:
         return pd.DataFrame(
             columns=[
@@ -124,15 +156,14 @@ def _build_monthly_summary(df: pd.DataFrame, statement_totals_by_file: Dict[str,
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["month"] = df["date"].dt.strftime("%Y-%m")
 
-    # numeric columns
     for c in ["debit", "credit", "balance"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # group monthly
     groups = []
     for month, g in df.groupby("month", dropna=True):
         g_sorted = g.sort_values(["date", "page"], ascending=[True, True], na_position="last")
+
         tx_count = 0
         for _, row in g_sorted.iterrows():
             desc = str(row.get("description") or "").upper()
@@ -152,7 +183,6 @@ def _build_monthly_summary(df: pd.DataFrame, statement_totals_by_file: Dict[str,
         balances = g_sorted["balance"].dropna().tolist()
 
         if balances:
-            # opening = first non-null balance in month
             opening_balance = float(balances[0])
             ending_balance = float(balances[-1])
 
@@ -162,7 +192,7 @@ def _build_monthly_summary(df: pd.DataFrame, statement_totals_by_file: Dict[str,
         net_change = None
         if opening_balance is not None and ending_balance is not None:
             net_change = float(ending_balance - opening_balance)
-        elif total_debit or total_credit:
+        else:
             net_change = float(total_credit - total_debit)
 
         highest_balance = float(max(balances)) if balances else None
@@ -186,13 +216,9 @@ def _build_monthly_summary(df: pd.DataFrame, statement_totals_by_file: Dict[str,
 
     summary = pd.DataFrame(groups).sort_values("month")
 
-    # Optional overlay from statement totals:
-    # statement_totals_by_file: filename -> { month -> {opening_balance, ending_balance, total_debit, total_credit, ...}}
-    # We will fill missing opening/ending or override if statement values exist.
+    # Overlay statement totals when available
     for fname, month_map in (statement_totals_by_file or {}).items():
         for month, totals in (month_map or {}).items():
-            if summary.empty:
-                continue
             idx = summary.index[summary["month"] == month].tolist()
             if not idx:
                 continue
@@ -203,29 +229,25 @@ def _build_monthly_summary(df: pd.DataFrame, statement_totals_by_file: Dict[str,
             td = totals.get("total_debit")
             tc = totals.get("total_credit")
 
-            # prefer statement opening/ending when available (more reliable than inferred from balances)
             if ob is not None:
                 summary.at[i, "opening_balance"] = round(float(ob), 2)
-            if eb is not None:
-                # we don't have ending_balance column; reflect into net_change by recompute below
-                ending_balance = float(eb)
-                opening_balance = summary.at[i, "opening_balance"]
-                if opening_balance is not None and pd.notna(opening_balance):
-                    summary.at[i, "net_change"] = round(ending_balance - float(opening_balance), 2)
-
-            # statement totals override computed totals (keeps consistent with statement)
             if td is not None:
                 summary.at[i, "total_debit"] = round(float(td), 2)
             if tc is not None:
                 summary.at[i, "total_credit"] = round(float(tc), 2)
 
-            # ensure source_files includes this file
+            if eb is not None:
+                ending_balance = float(eb)
+                opening_balance = summary.at[i, "opening_balance"]
+                if opening_balance is not None and pd.notna(opening_balance):
+                    summary.at[i, "net_change"] = round(ending_balance - float(opening_balance), 2)
+
             sf = summary.at[i, "source_files"]
             if isinstance(sf, list) and fname not in sf:
                 sf.append(fname)
                 summary.at[i, "source_files"] = sorted(sf)
 
-    # recompute net_change from totals if missing
+    # Fill missing net_change from totals
     for i in range(len(summary)):
         if pd.isna(summary.at[i, "net_change"]) or summary.at[i, "net_change"] is None:
             summary.at[i, "net_change"] = round(float(summary.at[i, "total_credit"]) - float(summary.at[i, "total_debit"]), 2)
@@ -237,11 +259,10 @@ def main() -> None:
     st.set_page_config(page_title="Bank Statement Parser", page_icon="🏦", layout="wide")
     st.title("🏦 Bank Statement Parser")
 
-    # --- Session state init ---
     for key, default in [
         ("results", []),
         ("errors", []),
-        ("statement_totals_by_file", {}),  # filename -> {month->totals}
+        ("statement_totals_by_file", {}),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -267,7 +288,6 @@ def main() -> None:
 
     uploaded_files = st.file_uploader("Upload one or more PDFs", type=["pdf"], accept_multiple_files=True)
 
-    # Bank parser mapping — normalized to signature (pdf_bytes, filename) -> txns_raw
     bank_parsers: Dict[str, Callable[[bytes, str], List[dict]]] = {
         "Maybank": lambda b, f: parse_transactions_maybank(b, f),
         "Public Bank": lambda b, f: _parse_with_pdfplumber(parse_transactions_pbb, b, f),
@@ -284,7 +304,6 @@ def main() -> None:
         "Alliance Bank": lambda b, f: _parse_with_pdfplumber(parse_alliance_bank, b, f),
     }
 
-    # Detect encrypted files to trigger password UI
     encrypted_names: List[str] = []
     if uploaded_files:
         for uf in uploaded_files:
@@ -292,7 +311,6 @@ def main() -> None:
                 if is_pdf_encrypted(uf.getvalue()):
                     encrypted_names.append(uf.name)
             except Exception:
-                # If detection fails, we assume it might be encrypted.
                 encrypted_names.append(uf.name)
 
     pdf_password: Optional[str] = None
@@ -316,37 +334,31 @@ def main() -> None:
             try:
                 raw_bytes = uf.getvalue()
 
-                # Decrypt if needed
                 if is_pdf_encrypted(raw_bytes):
                     raw_bytes = decrypt_pdf_bytes(raw_bytes, pdf_password)
 
-                # Parse statement totals (optional, used to fill missing summary fields)
                 totals = _extract_statement_totals(bank_choice, raw_bytes)
                 if totals:
                     st.session_state.statement_totals_by_file[fname] = totals
 
-                # Parse using bank-specific parser
                 txns_raw = bank_parsers[bank_choice](raw_bytes, fname) or []
-
                 txns = normalize_transactions(txns_raw, default_bank=bank_choice, source_file=fname)
+
                 if bank_choice == "Affin Bank":
                     txns = dedupe_transactions_affin(txns)
                 else:
                     txns = dedupe_transactions(txns)
 
-                # Mandatory OCR fallback: if no real txns found OR force_ocr checked
                 if force_ocr or _count_real_transactions(txns) == 0:
                     st.info(f"OCR fallback triggered for: {fname}")
                     pages_text = ocr_pdf_to_text_pages(raw_bytes, dpi=220)
                     ocr_raw = parse_transactions_from_ocr_text_pages(pages_text, bank_choice, fname)
-
                     ocr_txns = normalize_transactions(ocr_raw, default_bank=bank_choice, source_file=fname)
-                    if bank_choice == "Affin Bank":
-                        merged = dedupe_transactions_affin(txns + ocr_txns)
-                    else:
-                        merged = dedupe_transactions(txns + ocr_txns)
 
-                    txns = merged
+                    if bank_choice == "Affin Bank":
+                        txns = dedupe_transactions_affin(txns + ocr_txns)
+                    else:
+                        txns = dedupe_transactions(txns + ocr_txns)
 
                 st.session_state.results.extend(txns)
 
@@ -358,7 +370,6 @@ def main() -> None:
         progress.empty()
         st.success("Processing completed.")
 
-    # --- Results ---
     if st.session_state.errors:
         st.error("Some files failed to process:")
         st.json(st.session_state.errors)
